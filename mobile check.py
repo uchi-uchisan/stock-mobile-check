@@ -25,6 +25,7 @@ TEXT_MUTED = "#7C8494"
 ACCENT = "#6E8BFF"   # ブランド・見出し
 POSITIVE = "#3DDC84"  # 収縮・改善（良いサイン）
 NEGATIVE = "#FF6B6B"  # 拡大・悪化
+AMBER = "#F5A623"    # 惜しい・もう一歩
 
 st.markdown(f"""
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -414,6 +415,38 @@ def render_mini_chart(df: pd.DataFrame, days: int = 260):
     st.line_chart(chart_df, height=200, color=[TEXT, ACCENT, NEGATIVE])
 
 
+RANK_INFO = {
+    # (色, 説明文)。厳しさの序列（厳しい→緩い）＝オーバーヘッド解消 > VCP収縮 > 50日/200日線。
+    "S": (POSITIVE, "トレンド◎・オーバーヘッドなし・VCP収縮あり（3条件すべて達成）"),
+    "A": (ACCENT, "トレンド◎・オーバーヘッドなし・VCP収縮はまだ（一番厳しい条件はクリア済み）"),
+    "B": (AMBER, "トレンド◎・VCP収縮あり・オーバーヘッド解消まであと10%以内"),
+    "C": (TEXT_MUTED, "トレンドは良いが、オーバーヘッド・VCPともに条件を満たさない"),
+    "F": (NEGATIVE, "トレンドそのものが崩れている（50日線または200日線を割れ）"),
+}
+
+
+def rank_chart_quality(ev: dict) -> str:
+    """厳しさをS/A/B/C/Fの5段階で返す。
+    S：3条件すべて達成（一番厳しい）
+    A：オーバーヘッドは解消済みだがVCP収縮がまだ（2番目に厳しい条件までクリア）
+    B：VCP収縮はあるが、オーバーヘッド解消まであと10%以内（惜しい）
+    C：トレンドは良いが、オーバーヘッド・VCPともに未達成
+    F：トレンドそのものが崩れている（一番緩い＝そもそも土俵に乗っていない）"""
+    trend_ok = bool(ev["above_50ma"] and ev["above_200ma"])
+    if not trend_ok:
+        return "F"
+    no_overhead = not ev["has_overhead"]
+    has_vcp = bool(ev["has_vcp"])
+    gap = ev.get("overhead_gap_pct")
+    if no_overhead and has_vcp:
+        return "S"
+    if no_overhead and not has_vcp:
+        return "A"
+    if ev["has_overhead"] and has_vcp and gap is not None and gap <= 10:
+        return "B"
+    return "C"
+
+
 def reasons_text(ev: dict) -> str:
     """判定結果（evaluate_chart_qualityの戻り値）から、人が読める理由の一覧を組み立てる。"""
     lines = []
@@ -552,11 +585,16 @@ with tab_single:
             st.dataframe(df.sort_values("date", ascending=False), use_container_width=True, height=300)
 
 with tab_screen:
-    st.markdown('<div class="section-title">米国株スクリーニング（厳しめ判定）</div>', unsafe_allow_html=True)
-    st.caption("Finvizなどで事前に絞り込んだ候補ティッカーを貼り付けると、「美しいチャート」の"
-              "条件（50日線・200日線の上／未解消のオーバーヘッドサプライなし／VCP収縮あり）を"
-              "すべて満たす銘柄だけを抽出します。あくまで機械的な近似判定なので、"
+    st.markdown('<div class="section-title">米国株スクリーニング（厳しさランク付き）</div>', unsafe_allow_html=True)
+    st.caption("Finvizなどで事前に絞り込んだ候補ティッカーを貼り付けると、3つの条件（厳しい順に "
+              "①オーバーヘッドサプライの解消 → ②VCP収縮 → ③50日線・200日線の上）の達成度合いで "
+              "S/A/B/C/Fの5段階ランクを付けます。あくまで機械的な近似判定なので、"
               "最終判断はご自身の目で行ってください。")
+    with st.expander("ランクの意味"):
+        for rank, (color, desc) in RANK_INFO.items():
+            st.markdown(f'<span style="color:{color};font-weight:700;font-family:\'JetBrains Mono\',monospace">'
+                       f'{rank}</span>　{desc}', unsafe_allow_html=True)
+
     tickers_raw = st.text_area("ティッカーを貼り付け（改行・カンマ・スペース区切り、いくつでも可）",
                                height=100, placeholder="例：\nAAPL\nMSFT, NVDA\nAMZN")
     run_screen = st.button("スクリーニング実行", type="primary", use_container_width=True)
@@ -567,7 +605,8 @@ with tab_screen:
         if not tickers:
             st.warning("ティッカーを1つ以上入力してください。")
         else:
-            pass_list, close_list, fail_list, error_list = [], [], [], []
+            ranked = {"S": [], "A": [], "B": [], "C": [], "F": []}
+            error_list = []
             progress = st.progress(0.0, text="判定中...")
             for i, tk in enumerate(tickers):
                 try:
@@ -576,56 +615,49 @@ with tab_screen:
                         error_list.append(tk)
                     else:
                         ev = evaluate_chart_quality(d)
-                        if ev["is_beautiful"]:
-                            pass_list.append((tk, ev, d))
-                        elif ev["is_close_to_beautiful"]:
-                            close_list.append((tk, ev, d))
-                        else:
-                            fail_list.append((tk, ev, d))
+                        rank = rank_chart_quality(ev)
+                        ranked[rank].append((tk, ev, d))
                 except Exception:
                     error_list.append(tk)
                 progress.progress((i + 1) / len(tickers), text=f"判定中... {i+1}/{len(tickers)}")
             progress.empty()
-            st.session_state["screen_results"] = (pass_list, close_list, fail_list, error_list)
+            st.session_state["screen_results"] = (ranked, error_list)
 
     if "screen_results" in st.session_state:
-        pass_list, close_list, fail_list, error_list = st.session_state["screen_results"]
+        ranked, error_list = st.session_state["screen_results"]
 
-        st.markdown(f'<div class="section-title">✅ 合格（{len(pass_list)}銘柄）</div>',
-                   unsafe_allow_html=True)
-        if pass_list:
-            for tk, ev, d in pass_list:
-                contractions_str = "→".join(f"{c}%" for c in ev["contractions"])
-                st.markdown(
-                    stat_card_html(tk, "合格", sub=f"収縮：{contractions_str}", color=POSITIVE),
-                    unsafe_allow_html=True)
-                render_mini_chart(d)
-                st.caption(reasons_text(ev).replace("\n", "　|　"))
-                st.markdown('<hr class="divider">', unsafe_allow_html=True)
-        else:
-            st.caption("条件をすべて満たす銘柄はありませんでした。")
-
-        st.markdown(f'<div class="section-title">🔶 あと少し（{len(close_list)}銘柄・'
-                   'オーバーヘッド解消まで10%以内）</div>', unsafe_allow_html=True)
-        if close_list:
-            for tk, ev, d in close_list:
-                st.markdown(
-                    stat_card_html(tk, f"あと{ev['overhead_gap_pct']}%で高値更新",
-                                  sub="新高値を付ければ合格ラインに入る可能性", color=ACCENT),
-                    unsafe_allow_html=True)
-                render_mini_chart(d)
-                st.caption(reasons_text(ev).replace("\n", "　|　"))
-                st.markdown('<hr class="divider">', unsafe_allow_html=True)
-        else:
-            st.caption("該当銘柄はありませんでした。")
-
-        with st.expander(f"不合格・データ不足など（{len(fail_list) + len(error_list)}銘柄）"):
-            for tk, ev, d in fail_list:
-                st.write(f"**{tk}**")
-                st.caption(reasons_text(ev).replace("\n", "　|　"))
-                if st.checkbox(f"{tk} のチャートを見る", key=f"fail_chart_{tk}"):
+        for rank in ["S", "A", "B"]:
+            color, desc = RANK_INFO[rank]
+            items = ranked[rank]
+            st.markdown(f'<div class="section-title">'
+                       f'<span style="color:{color};font-weight:700;font-family:\'JetBrains Mono\',monospace">'
+                       f'{rank}ランク</span>　{desc}（{len(items)}銘柄）</div>', unsafe_allow_html=True)
+            if items:
+                for tk, ev, d in items:
+                    contractions_str = "→".join(f"{c}%" for c in ev["contractions"]) if ev["contractions"] else "―"
+                    sub = f"収縮：{contractions_str}"
+                    if ev["has_overhead"]:
+                        sub += f"　｜オーバーヘッドまであと{ev['overhead_gap_pct']}%"
+                    st.markdown(stat_card_html(tk, f"{rank}ランク", sub=sub, color=color),
+                               unsafe_allow_html=True)
                     render_mini_chart(d)
-                st.markdown('<hr class="divider">', unsafe_allow_html=True)
+                    st.caption(reasons_text(ev).replace("\n", "　|　"))
+                    st.markdown('<hr class="divider">', unsafe_allow_html=True)
+            else:
+                st.caption("該当銘柄はありませんでした。")
+
+        c_items, f_items = ranked["C"], ranked["F"]
+        with st.expander(f"C・Fランク・データ取得失敗（{len(c_items) + len(f_items) + len(error_list)}銘柄）"):
+            for rank in ["C", "F"]:
+                color, desc = RANK_INFO[rank]
+                for tk, ev, d in ranked[rank]:
+                    st.markdown(f'<span style="color:{color};font-weight:700;'
+                               f'font-family:\'JetBrains Mono\',monospace">{rank}</span> **{tk}**',
+                               unsafe_allow_html=True)
+                    st.caption(reasons_text(ev).replace("\n", "　|　"))
+                    if st.checkbox(f"{tk} のチャートを見る", key=f"cf_chart_{tk}"):
+                        render_mini_chart(d)
+                    st.markdown('<hr class="divider">', unsafe_allow_html=True)
             for tk in error_list:
                 st.write(f"**{tk}**：データ取得失敗")
 
