@@ -65,14 +65,22 @@ st.markdown(f"""
       border-top: 1px solid {BORDER};
       margin: 1.3rem 0;
   }}
-  /* 入力欄・セレクトボックス */
-  div[data-testid="stTextInput"] input, div[data-baseweb="select"] > div {{
+  /* 入力欄・セレクトボックス・テキストエリア（複数行入力） */
+  div[data-testid="stTextInput"] input,
+  div[data-testid="stTextArea"] textarea,
+  div[data-baseweb="select"] > div {{
       background-color: {SURFACE} !important;
       border: 1px solid {BORDER} !important;
       color: {TEXT} !important;
       border-radius: 8px !important;
+      -webkit-text-fill-color: {TEXT} !important;
   }}
-  label, .stSelectbox label, .stTextInput label {{
+  div[data-testid="stTextArea"] textarea::placeholder,
+  div[data-testid="stTextInput"] input::placeholder {{
+      color: {TEXT_MUTED} !important;
+      opacity: 1 !important;
+  }}
+  label, .stSelectbox label, .stTextInput label, .stTextArea label {{
       color: {TEXT_MUTED} !important;
       font-size: 0.82rem !important;
   }}
@@ -395,6 +403,39 @@ def range_bar_html(label: str, days: int, pct, max_scale: float = 60.0) -> str:
             f'style="width:{width}%;background-color:{color}"></div></div></div>')
 
 
+def render_mini_chart(df: pd.DataFrame, days: int = 260):
+    """終値・50日線・200日線を重ねた小さな折れ線チャートを表示する。
+    「なぜ合格/不合格なのか」をチャートの形そのもので確認できるようにするために使う。"""
+    d = df.dropna(subset=["close"]).sort_values("date").reset_index(drop=True).copy()
+    d["50日線"] = d["close"].rolling(50).mean()
+    d["200日線"] = d["close"].rolling(200).mean()
+    chart_df = d.tail(days).set_index("date")[["close", "50日線", "200日線"]]
+    chart_df = chart_df.rename(columns={"close": "終値"})
+    st.line_chart(chart_df, height=200, color=[TEXT, ACCENT, NEGATIVE])
+
+
+def reasons_text(ev: dict) -> str:
+    """判定結果（evaluate_chart_qualityの戻り値）から、人が読める理由の一覧を組み立てる。"""
+    lines = []
+    lines.append(("✅" if ev["above_50ma"] else "❌") + " 50日線："
+                 + ("上" if ev["above_50ma"] else "下"))
+    lines.append(("✅" if ev["above_200ma"] else "❌") + " 200日線："
+                 + ("上" if ev["above_200ma"] else "下"))
+    if ev["has_overhead"]:
+        lines.append(f"❌ オーバーヘッドサプライ：あり（急落前の高値まであと{ev['overhead_gap_pct']}%・未回復）")
+    else:
+        lines.append("✅ オーバーヘッドサプライ：なし")
+    if ev["has_vcp"]:
+        contractions_str = "→".join(f"{c}%" for c in ev["contractions"])
+        lines.append(f"✅ VCP収縮：あり（押し目の下落率が縮小　{contractions_str}）")
+    elif ev["contractions"]:
+        contractions_str = "→".join(f"{c}%" for c in ev["contractions"])
+        lines.append(f"❌ VCP収縮：なし（押し目はあるが縮小していない　{contractions_str}）")
+    else:
+        lines.append("❌ VCP収縮：判定できる押し目が見つからず")
+    return "\n".join(lines)
+
+
 # ----------------------------------------------------------------------
 # 画面
 # ----------------------------------------------------------------------
@@ -536,53 +577,56 @@ with tab_screen:
                     else:
                         ev = evaluate_chart_quality(d)
                         if ev["is_beautiful"]:
-                            pass_list.append((tk, ev))
+                            pass_list.append((tk, ev, d))
                         elif ev["is_close_to_beautiful"]:
-                            close_list.append((tk, ev))
+                            close_list.append((tk, ev, d))
                         else:
-                            fail_list.append((tk, ev))
+                            fail_list.append((tk, ev, d))
                 except Exception:
                     error_list.append(tk)
                 progress.progress((i + 1) / len(tickers), text=f"判定中... {i+1}/{len(tickers)}")
             progress.empty()
+            st.session_state["screen_results"] = (pass_list, close_list, fail_list, error_list)
 
-            st.markdown(f'<div class="section-title">✅ 合格（{len(pass_list)}銘柄）</div>',
-                       unsafe_allow_html=True)
-            if pass_list:
-                for tk, ev in pass_list:
-                    contractions_str = "→".join(f"{c}%" for c in ev["contractions"])
-                    st.markdown(
-                        stat_card_html(tk, "合格", sub=f"収縮：{contractions_str}", color=POSITIVE),
-                        unsafe_allow_html=True)
-            else:
-                st.caption("条件をすべて満たす銘柄はありませんでした。")
+    if "screen_results" in st.session_state:
+        pass_list, close_list, fail_list, error_list = st.session_state["screen_results"]
 
-            st.markdown(f'<div class="section-title">🔶 あと少し（{len(close_list)}銘柄・'
-                       'オーバーヘッド解消まで10%以内）</div>', unsafe_allow_html=True)
-            if close_list:
-                for tk, ev in close_list:
-                    st.markdown(
-                        stat_card_html(tk, f"あと{ev['overhead_gap_pct']}%で高値更新",
-                                      sub="新高値を付ければ合格ラインに入る可能性", color=ACCENT),
-                        unsafe_allow_html=True)
-            else:
-                st.caption("該当銘柄はありませんでした。")
+        st.markdown(f'<div class="section-title">✅ 合格（{len(pass_list)}銘柄）</div>',
+                   unsafe_allow_html=True)
+        if pass_list:
+            for tk, ev, d in pass_list:
+                contractions_str = "→".join(f"{c}%" for c in ev["contractions"])
+                st.markdown(
+                    stat_card_html(tk, "合格", sub=f"収縮：{contractions_str}", color=POSITIVE),
+                    unsafe_allow_html=True)
+                render_mini_chart(d)
+                st.caption(reasons_text(ev).replace("\n", "　|　"))
+                st.markdown('<hr class="divider">', unsafe_allow_html=True)
+        else:
+            st.caption("条件をすべて満たす銘柄はありませんでした。")
 
-            with st.expander(f"不合格・データ不足など（{len(fail_list) + len(error_list)}銘柄）"):
-                for tk, ev in fail_list:
-                    reasons = []
-                    if ev["above_50ma"] is False:
-                        reasons.append("50日線割れ")
-                    if ev["above_200ma"] is False:
-                        reasons.append("200日線割れ")
-                    if ev["has_overhead"]:
-                        reasons.append(f"オーバーヘッド未解消(あと{ev['overhead_gap_pct']}%)")
-                    if ev["has_vcp"] is False:
-                        reasons.append("収縮パターンなし")
-                    if ev["notes"]:
-                        reasons.extend(ev["notes"])
-                    st.write(f"**{tk}**：{' / '.join(reasons) if reasons else '判定不可'}")
-                for tk in error_list:
-                    st.write(f"**{tk}**：データ取得失敗")
+        st.markdown(f'<div class="section-title">🔶 あと少し（{len(close_list)}銘柄・'
+                   'オーバーヘッド解消まで10%以内）</div>', unsafe_allow_html=True)
+        if close_list:
+            for tk, ev, d in close_list:
+                st.markdown(
+                    stat_card_html(tk, f"あと{ev['overhead_gap_pct']}%で高値更新",
+                                  sub="新高値を付ければ合格ラインに入る可能性", color=ACCENT),
+                    unsafe_allow_html=True)
+                render_mini_chart(d)
+                st.caption(reasons_text(ev).replace("\n", "　|　"))
+                st.markdown('<hr class="divider">', unsafe_allow_html=True)
+        else:
+            st.caption("該当銘柄はありませんでした。")
+
+        with st.expander(f"不合格・データ不足など（{len(fail_list) + len(error_list)}銘柄）"):
+            for tk, ev, d in fail_list:
+                st.write(f"**{tk}**")
+                st.caption(reasons_text(ev).replace("\n", "　|　"))
+                if st.checkbox(f"{tk} のチャートを見る", key=f"fail_chart_{tk}"):
+                    render_mini_chart(d)
+                st.markdown('<hr class="divider">', unsafe_allow_html=True)
+            for tk in error_list:
+                st.write(f"**{tk}**：データ取得失敗")
 
 
