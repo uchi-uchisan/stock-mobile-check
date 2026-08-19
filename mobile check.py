@@ -283,8 +283,8 @@ def evaluate_chart_quality(df: pd.DataFrame) -> dict:
                   contractions, is_beautiful, is_close_to_beautiful, notes"""
     d = df.dropna(subset=["close", "high", "low"]).sort_values("date").reset_index(drop=True)
     result = {"above_50ma": None, "above_200ma": None, "has_overhead": None, "overhead_gap_pct": None,
-              "has_vcp": None, "contractions": [], "is_beautiful": False,
-              "is_close_to_beautiful": False, "notes": []}
+              "has_vcp": None, "contractions": [], "volume_contracting": None, "volume_dryup_ratio": None,
+              "is_beautiful": False, "is_close_to_beautiful": False, "notes": []}
     if len(d) < 210:
         result["notes"].append("データ不足（200日線の判定には210日以上必要）")
         return result
@@ -322,25 +322,52 @@ def evaluate_chart_quality(df: pd.DataFrame) -> dict:
         result["has_overhead"] = False
         result["overhead_gap_pct"] = 0.0
 
-    # --- VCP簡易判定 ---
+    # --- VCP簡易判定（値幅の収縮＋出来高の収縮の両方を見る） ---
     # 直近約6ヶ月（130営業日）のピボットから、山→谷の下落率を新しい順に並べ、
-    # 2回以上連続で下落率が縮小していれば「収縮あり」とする。
+    # 2回以上連続で下落率が縮小していれば「値幅の収縮あり」とする。
+    # 本来のVCPは、値幅だけでなく「押し目のたびに出来高も減っている」ことが重要な条件なので、
+    # 各押し目区間の平均出来高も合わせて確認する。
     recent = d.tail(130).reset_index(drop=True)
     pivots = zigzag_pivots(recent["close"].tolist(), threshold_pct=8.0)
     pullbacks = []
+    pullback_volumes = []
+    has_volume = "volume" in recent.columns and recent["volume"].notna().any()
     for j in range(1, len(pivots)):
         prev_idx, prev_price, prev_kind = pivots[j - 1]
         idx, price, kind = pivots[j]
         if prev_kind == "peak" and kind == "trough" and prev_price > 0:
             pullbacks.append(round((prev_price - price) / prev_price * 100, 1))
+            if has_volume:
+                seg_vol = recent["volume"].iloc[prev_idx:idx + 1]
+                pullback_volumes.append(seg_vol.mean() if len(seg_vol) else np.nan)
     if len(pullbacks) >= 2:
         last_pullbacks = pullbacks[-3:] if len(pullbacks) >= 3 else pullbacks
         is_contracting = all(last_pullbacks[k] > last_pullbacks[k + 1] for k in range(len(last_pullbacks) - 1))
         result["has_vcp"] = bool(is_contracting)
         result["contractions"] = last_pullbacks
+        # 出来高の収縮：値幅と同じ本数だけ末尾を揃えて比較し、押し目のたびに減っていればTrue
+        if has_volume and len(pullback_volumes) >= 2:
+            last_vols = pullback_volumes[-3:] if len(pullback_volumes) >= 3 else pullback_volumes
+            valid = [v for v in last_vols if pd.notna(v)]
+            if len(valid) == len(last_vols) and len(valid) >= 2:
+                result["volume_contracting"] = bool(
+                    all(last_vols[k] > last_vols[k + 1] for k in range(len(last_vols) - 1)))
+            else:
+                result["volume_contracting"] = None
+        else:
+            result["volume_contracting"] = None
     else:
         result["has_vcp"] = False
         result["contractions"] = pullbacks
+        result["volume_contracting"] = None
+
+    # 直近の出来高が、平常時（50日平均）と比べて枯れているかどうか（基盤形成中の目安）
+    if has_volume and len(recent) >= 50:
+        vol_ma50 = recent["volume"].rolling(50).mean().iloc[-1]
+        vol_recent10 = recent["volume"].tail(10).mean()
+        result["volume_dryup_ratio"] = round(vol_recent10 / vol_ma50, 2) if vol_ma50 else None
+    else:
+        result["volume_dryup_ratio"] = None
 
     result["is_beautiful"] = bool(result["above_50ma"] and result["above_200ma"]
                                   and not result["has_overhead"] and result["has_vcp"])
@@ -425,6 +452,52 @@ RANK_INFO = {
 }
 
 
+def evaluate_relative_strength(stock_df: pd.DataFrame, benchmark_df: pd.DataFrame, lookback: int = 60) -> dict:
+    """対S&P500の相対力（RS）を判定する。直近lookback営業日の騰落率を、
+    銘柄とベンチマークで比較する。指数が下げている局面で銘柄が踏みとどまっている・
+    上がっている場合は、その旨を説明文として生成する（リーダー株の典型的な値動き）。
+    戻り値：stock_return_pct, bench_return_pct, rs_status(強い/普通/弱い), explanation"""
+    s = stock_df.dropna(subset=["close"]).sort_values("date").tail(lookback + 1)
+    b = benchmark_df.dropna(subset=["close"]).sort_values("date").tail(lookback + 1)
+    if len(s) < 2 or len(b) < 2:
+        return {"stock_return_pct": None, "bench_return_pct": None, "rs_status": "判定不可", "explanation": ""}
+
+    stock_return = (s["close"].iloc[-1] / s["close"].iloc[0] - 1) * 100
+    bench_return = (b["close"].iloc[-1] / b["close"].iloc[0] - 1) * 100
+    diff = stock_return - bench_return
+
+    if diff >= 5:
+        rs_status = "強い"
+    elif diff <= -5:
+        rs_status = "弱い"
+    else:
+        rs_status = "普通"
+
+    explanation = ""
+    if bench_return < 0:
+        if stock_return > 0:
+            explanation = (f"直近{lookback}営業日でS&P500が{bench_return:.1f}%下落する中、"
+                          f"この銘柄は+{stock_return:.1f}%と上昇しています。指数の逆風下で買われている、"
+                          "相対的にかなり強い値動きです。")
+        elif stock_return > bench_return:
+            explanation = (f"直近{lookback}営業日でS&P500が{bench_return:.1f}%下落する中、"
+                          f"この銘柄は{stock_return:.1f}%と下げ幅を抑えています。指数ほど売られておらず、"
+                          "底堅い動きです。")
+        else:
+            explanation = (f"直近{lookback}営業日でS&P500が{bench_return:.1f}%下落する中、"
+                          f"この銘柄は{stock_return:.1f}%とそれ以上に下げています。指数より弱い動きです。")
+    else:
+        if stock_return > bench_return:
+            explanation = (f"直近{lookback}営業日でS&P500が+{bench_return:.1f}%の中、"
+                          f"この銘柄は+{stock_return:.1f}%とそれを上回っています。")
+        else:
+            explanation = (f"直近{lookback}営業日でS&P500が+{bench_return:.1f}%の中、"
+                          f"この銘柄は{stock_return:+.1f}%と指数ほど伸びていません。")
+
+    return {"stock_return_pct": round(stock_return, 1), "bench_return_pct": round(bench_return, 1),
+            "rs_status": rs_status, "explanation": explanation}
+
+
 def rank_chart_quality(ev: dict) -> str:
     """厳しさをS/A/B/C/Fの5段階で返す。
     S：3条件すべて達成（一番厳しい）
@@ -466,6 +539,14 @@ def reasons_text(ev: dict) -> str:
         lines.append(f"❌ VCP収縮：なし（押し目はあるが縮小していない　{contractions_str}）")
     else:
         lines.append("❌ VCP収縮：判定できる押し目が見つからず")
+    if ev.get("volume_contracting") is True:
+        lines.append("✅ 出来高：押し目のたびに減少（枯れてきている＝良いサイン）")
+    elif ev.get("volume_contracting") is False:
+        lines.append("❌ 出来高：押し目でも減っていない")
+    if ev.get("volume_dryup_ratio") is not None:
+        ratio = ev["volume_dryup_ratio"]
+        lines.append(f"　直近10日間の出来高は50日平均の{ratio:.2f}倍"
+                     + ("（枯れている）" if ratio < 0.8 else ("（多い）" if ratio > 1.3 else "")))
     return "\n".join(lines)
 
 
@@ -605,6 +686,12 @@ with tab_screen:
         if not tickers:
             st.warning("ティッカーを1つ以上入力してください。")
         else:
+            with st.spinner("ベンチマーク（S&P500）を取得中..."):
+                try:
+                    benchmark_df = fetch_prices("^GSPC", days=400)
+                except Exception:
+                    benchmark_df = pd.DataFrame()
+
             ranked = {"S": [], "A": [], "B": [], "C": [], "F": []}
             error_list = []
             progress = st.progress(0.0, text="判定中...")
@@ -615,6 +702,11 @@ with tab_screen:
                         error_list.append(tk)
                     else:
                         ev = evaluate_chart_quality(d)
+                        if not benchmark_df.empty:
+                            ev["rs"] = evaluate_relative_strength(d, benchmark_df, lookback=60)
+                        else:
+                            ev["rs"] = {"stock_return_pct": None, "bench_return_pct": None,
+                                       "rs_status": "判定不可", "explanation": ""}
                         rank = rank_chart_quality(ev)
                         ranked[rank].append((tk, ev, d))
                 except Exception:
@@ -640,6 +732,15 @@ with tab_screen:
                         sub += f"　｜オーバーヘッドまであと{ev['overhead_gap_pct']}%"
                     st.markdown(stat_card_html(tk, f"{rank}ランク", sub=sub, color=color),
                                unsafe_allow_html=True)
+                    rs = ev.get("rs", {})
+                    if rs.get("rs_status") and rs["rs_status"] != "判定不可":
+                        rs_color = {"強い": POSITIVE, "普通": TEXT_MUTED, "弱い": NEGATIVE}.get(rs["rs_status"], TEXT)
+                        st.markdown(stat_card_html(
+                            "対S&P500 相対力（60営業日）", f"RS {rs['rs_status']}",
+                            sub=f"銘柄 {rs['stock_return_pct']:+.1f}%　vs　指数 {rs['bench_return_pct']:+.1f}%",
+                            color=rs_color), unsafe_allow_html=True)
+                        if rs.get("explanation"):
+                            st.caption(f"💬 {rs['explanation']}")
                     render_mini_chart(d)
                     st.caption(reasons_text(ev).replace("\n", "　|　"))
                     st.markdown('<hr class="divider">', unsafe_allow_html=True)
