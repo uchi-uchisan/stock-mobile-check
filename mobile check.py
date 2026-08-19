@@ -282,19 +282,23 @@ def evaluate_chart_quality(df: pd.DataFrame) -> dict:
     戻り値のkeys: above_50ma, above_200ma, has_overhead, overhead_gap_pct, has_vcp,
                   contractions, is_beautiful, is_close_to_beautiful, notes"""
     d = df.dropna(subset=["close", "high", "low"]).sort_values("date").reset_index(drop=True)
-    result = {"above_50ma": None, "above_200ma": None, "has_overhead": None, "overhead_gap_pct": None,
+    result = {"above_50ma": None, "above_200ma": None, "sma200_rising": None,
+              "has_overhead": None, "overhead_gap_pct": None,
               "has_vcp": None, "contractions": [], "volume_contracting": None, "volume_dryup_ratio": None,
               "is_beautiful": False, "is_close_to_beautiful": False, "notes": []}
-    if len(d) < 210:
-        result["notes"].append("データ不足（200日線の判定には210日以上必要）")
+    if len(d) < 231:
+        result["notes"].append("データ不足（200日線が1ヶ月前上向きだったかの判定には231日以上必要）")
         return result
 
     close = d["close"]
+    sma200_series = close.rolling(200).mean()
     sma50 = close.rolling(50).mean().iloc[-1]
-    sma200 = close.rolling(200).mean().iloc[-1]
+    sma200 = sma200_series.iloc[-1]
+    sma200_1mo_ago = sma200_series.iloc[-22]  # 約1ヶ月（21営業日）前の200日線
     last_close = close.iloc[-1]
     result["above_50ma"] = bool(last_close > sma50)
     result["above_200ma"] = bool(last_close > sma200)
+    result["sma200_rising"] = bool(sma200 > sma200_1mo_ago) if pd.notna(sma200_1mo_ago) else None
 
     # --- オーバーヘッドサプライ判定 ---
     # 直近約1年（250営業日）の中で、15営業日以内に20%以上下落した箇所（急落）を探す。
@@ -369,12 +373,12 @@ def evaluate_chart_quality(df: pd.DataFrame) -> dict:
     else:
         result["volume_dryup_ratio"] = None
 
-    result["is_beautiful"] = bool(result["above_50ma"] and result["above_200ma"]
+    result["is_beautiful"] = bool(result["above_50ma"] and result["above_200ma"] and result["sma200_rising"]
                                   and not result["has_overhead"] and result["has_vcp"])
     # 「あと少しで綺麗になる」＝トレンドは合格・VCPも収縮傾向はあるが、
     # オーバーヘッドの解消まで10%以内、というケースを拾う（新高値更新で解消しうる候補）
     result["is_close_to_beautiful"] = bool(
-        not result["is_beautiful"] and result["above_50ma"] and result["above_200ma"]
+        not result["is_beautiful"] and result["above_50ma"] and result["above_200ma"] and result["sma200_rising"]
         and result["has_overhead"] and result["overhead_gap_pct"] is not None
         and 0 < result["overhead_gap_pct"] <= 10)
     return result
@@ -448,7 +452,7 @@ RANK_INFO = {
     "A": (ACCENT, "トレンド◎・オーバーヘッドなし・VCP収縮はまだ（一番厳しい条件はクリア済み）"),
     "B": (AMBER, "トレンド◎・VCP収縮あり・オーバーヘッド解消まであと10%以内"),
     "C": (TEXT_MUTED, "トレンドは良いが、オーバーヘッド・VCPともに条件を満たさない"),
-    "F": (NEGATIVE, "トレンドそのものが崩れている（50日線または200日線を割れ）"),
+    "F": (NEGATIVE, "トレンドそのものが崩れている（50日線・200日線割れ、または200日線が下向き）"),
 }
 
 
@@ -505,7 +509,7 @@ def rank_chart_quality(ev: dict) -> str:
     B：VCP収縮はあるが、オーバーヘッド解消まであと10%以内（惜しい）
     C：トレンドは良いが、オーバーヘッド・VCPともに未達成
     F：トレンドそのものが崩れている（一番緩い＝そもそも土俵に乗っていない）"""
-    trend_ok = bool(ev["above_50ma"] and ev["above_200ma"])
+    trend_ok = bool(ev["above_50ma"] and ev["above_200ma"] and ev.get("sma200_rising"))
     if not trend_ok:
         return "F"
     no_overhead = not ev["has_overhead"]
@@ -527,6 +531,9 @@ def reasons_text(ev: dict) -> str:
                  + ("上" if ev["above_50ma"] else "下"))
     lines.append(("✅" if ev["above_200ma"] else "❌") + " 200日線："
                  + ("上" if ev["above_200ma"] else "下"))
+    if ev.get("sma200_rising") is not None:
+        lines.append(("✅" if ev["sma200_rising"] else "❌") + " 200日線の向き："
+                     + ("上向き（1ヶ月前比）" if ev["sma200_rising"] else "下向き・横ばい（1ヶ月前比）"))
     if ev["has_overhead"]:
         lines.append(f"❌ オーバーヘッドサプライ：あり（急落前の高値まであと{ev['overhead_gap_pct']}%・未回復）")
     else:
