@@ -7,6 +7,8 @@ DB（analysis_data.db）には一切依存しない、単体で動くスタン�
 GitHub + Streamlit Community Cloud での公開を想定している。
 """
 
+import re
+
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -405,11 +407,19 @@ def evaluate_chart_quality(df: pd.DataFrame) -> dict:
 # ----------------------------------------------------------------------
 
 def normalize_ticker(raw: str) -> str:
-    """入力補正：日本株の証券コード（数字4桁など）だけが入力された場合、
-    「.T」を付け忘れているケースが多いため、自動で補完する。
-    すでに「.」や「^」を含む場合（.T付き・米国指数など）はそのまま使う。"""
+    """入力補正：日本株の証券コードだけが入力された場合、「.T」を付け忘れているケースが多いため、
+    自動で補完する。すでに「.」「^」「=」を含む場合（.T付き・米国指数・先物など）はそのまま使う。
+    対応パターン：
+    - 従来の4桁数字コード（例：3964）
+    - 東証が2024年以降、新規上場銘柄に割り当て始めた「数字3桁＋英字1桁」の新形式コード
+      （例：212A＝フィットイージー）。数字を含まない純アルファベットは米国株ティッカーと
+      区別がつかないため対象外（AAPLなどを誤って.T化しないように）。"""
     t = raw.strip().upper()
-    if t and t.replace(".", "").isdigit() and "." not in t:
+    if not t or "." in t or "^" in t or "=" in t:
+        return t
+    if re.fullmatch(r"\d{3,4}", t):
+        return f"{t}.T"
+    if re.fullmatch(r"\d{3}[A-Z]", t):
         return f"{t}.T"
     return t
 
