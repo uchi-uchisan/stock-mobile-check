@@ -412,6 +412,22 @@ def fetch_prices(ticker: str, days: int = 120) -> pd.DataFrame:
     return data[["date", "open", "high", "low", "close", "volume"]].tail(days).reset_index(drop=True)
 
 
+@st.cache_data(ttl=3600 * 12)  # 会社名は滅多に変わらないので長めにキャッシュ
+def fetch_company_name(ticker: str) -> str:
+    """Yahoo!ファイナンスから会社名を取得する。取得できない場合は空文字を返す
+    （ティッカー表示だけになるが、処理は止めない）。"""
+    try:
+        info = yf.Ticker(ticker).info
+        return info.get("shortName") or info.get("longName") or ""
+    except Exception:
+        return ""
+
+
+def is_jp_ticker(ticker: str) -> bool:
+    """「.T」で終わる日本株ティッカーかどうかを判定する。"""
+    return ticker.strip().upper().endswith(".T")
+
+
 # ----------------------------------------------------------------------
 # 表示用ヘルパー
 # ----------------------------------------------------------------------
@@ -456,10 +472,12 @@ RANK_INFO = {
 }
 
 
-def evaluate_relative_strength(stock_df: pd.DataFrame, benchmark_df: pd.DataFrame, lookback: int = 60) -> dict:
-    """対S&P500の相対力（RS）を判定する。直近lookback営業日の騰落率を、
+def evaluate_relative_strength(stock_df: pd.DataFrame, benchmark_df: pd.DataFrame, lookback: int = 60,
+                               benchmark_name: str = "S&P500") -> dict:
+    """対ベンチマークの相対力（RS）を判定する。直近lookback営業日の騰落率を、
     銘柄とベンチマークで比較する。指数が下げている局面で銘柄が踏みとどまっている・
     上がっている場合は、その旨を説明文として生成する（リーダー株の典型的な値動き）。
+    benchmark_nameは説明文に使う表示名（例："S&P500"／"TOPIX"）。
     戻り値：stock_return_pct, bench_return_pct, rs_status(強い/普通/弱い), explanation"""
     s = stock_df.dropna(subset=["close"]).sort_values("date").tail(lookback + 1)
     b = benchmark_df.dropna(subset=["close"]).sort_values("date").tail(lookback + 1)
@@ -480,26 +498,26 @@ def evaluate_relative_strength(stock_df: pd.DataFrame, benchmark_df: pd.DataFram
     explanation = ""
     if bench_return < 0:
         if stock_return > 0:
-            explanation = (f"直近{lookback}営業日でS&P500が{bench_return:.1f}%下落する中、"
+            explanation = (f"直近{lookback}営業日で{benchmark_name}が{bench_return:.1f}%下落する中、"
                           f"この銘柄は+{stock_return:.1f}%と上昇しています。指数の逆風下で買われている、"
                           "相対的にかなり強い値動きです。")
         elif stock_return > bench_return:
-            explanation = (f"直近{lookback}営業日でS&P500が{bench_return:.1f}%下落する中、"
+            explanation = (f"直近{lookback}営業日で{benchmark_name}が{bench_return:.1f}%下落する中、"
                           f"この銘柄は{stock_return:.1f}%と下げ幅を抑えています。指数ほど売られておらず、"
                           "底堅い動きです。")
         else:
-            explanation = (f"直近{lookback}営業日でS&P500が{bench_return:.1f}%下落する中、"
+            explanation = (f"直近{lookback}営業日で{benchmark_name}が{bench_return:.1f}%下落する中、"
                           f"この銘柄は{stock_return:.1f}%とそれ以上に下げています。指数より弱い動きです。")
     else:
         if stock_return > bench_return:
-            explanation = (f"直近{lookback}営業日でS&P500が+{bench_return:.1f}%の中、"
+            explanation = (f"直近{lookback}営業日で{benchmark_name}が+{bench_return:.1f}%の中、"
                           f"この銘柄は+{stock_return:.1f}%とそれを上回っています。")
         else:
-            explanation = (f"直近{lookback}営業日でS&P500が+{bench_return:.1f}%の中、"
+            explanation = (f"直近{lookback}営業日で{benchmark_name}が+{bench_return:.1f}%の中、"
                           f"この銘柄は{stock_return:+.1f}%と指数ほど伸びていません。")
 
     return {"stock_return_pct": round(stock_return, 1), "bench_return_pct": round(bench_return, 1),
-            "rs_status": rs_status, "explanation": explanation}
+            "rs_status": rs_status, "explanation": explanation, "benchmark_name": benchmark_name}
 
 
 def rank_chart_quality(ev: dict) -> str:
@@ -525,14 +543,23 @@ def rank_chart_quality(ev: dict) -> str:
 
 
 def reasons_text(ev: dict) -> str:
-    """判定結果（evaluate_chart_qualityの戻り値）から、人が読める理由の一覧を組み立てる。"""
+    """判定結果（evaluate_chart_qualityの戻り値）から、人が読める理由の一覧を組み立てる。
+    値がNone（データ不足などで判定そのものができない）の場合は、False（未達）と混同しないよう
+    「❓判定不可」として表示する。"""
+    def mark(v):
+        if v is None:
+            return "❓"
+        return "✅" if v else "❌"
+
     lines = []
-    lines.append(("✅" if ev["above_50ma"] else "❌") + " 50日線："
-                 + ("上" if ev["above_50ma"] else "下"))
-    lines.append(("✅" if ev["above_200ma"] else "❌") + " 200日線："
-                 + ("上" if ev["above_200ma"] else "下"))
+    if ev.get("above_50ma") is None:
+        lines.append("❓ データ不足のため、50日線・200日線などの判定ができません"
+                     "（この銘柄は上場・設定からまだ日が浅い可能性があります）。")
+        return "\n".join(lines)
+    lines.append(mark(ev["above_50ma"]) + " 50日線：" + ("上" if ev["above_50ma"] else "下"))
+    lines.append(mark(ev["above_200ma"]) + " 200日線：" + ("上" if ev["above_200ma"] else "下"))
     if ev.get("sma200_rising") is not None:
-        lines.append(("✅" if ev["sma200_rising"] else "❌") + " 200日線の向き："
+        lines.append(mark(ev["sma200_rising"]) + " 200日線の向き："
                      + ("上向き（1ヶ月前比）" if ev["sma200_rising"] else "下向き・横ばい（1ヶ月前比）"))
     if ev["has_overhead"]:
         lines.append(f"❌ オーバーヘッドサプライ：あり（急落前の高値まであと{ev['overhead_gap_pct']}%・未回復）")
@@ -570,9 +597,13 @@ st.markdown(f"""
 </div>
 """, unsafe_allow_html=True)
 
-tab_single, tab_screen = st.tabs(["個別チェック", "米国株スクリーニング"])
+tab_single, tab_screen = "個別チェック", "スクリーニング"
+if "active_tab" not in st.session_state:
+    st.session_state["active_tab"] = tab_single
+active_tab = st.radio("表示切り替え", [tab_single, tab_screen], key="active_tab",
+                      horizontal=True, label_visibility="collapsed")
 
-with tab_single:
+if active_tab == tab_single:
     with st.form("ticker_form"):
         ticker_input = st.text_input("ティッカーまたは証券コード", placeholder="例：3964　または　AAPL")
         submitted = st.form_submit_button("取得", type="primary", use_container_width=True)
@@ -672,34 +703,39 @@ with tab_single:
         with st.expander(f"株価データ（取得済み{len(df)}日分・新しい順）"):
             st.dataframe(df.sort_values("date", ascending=False), use_container_width=True, height=300)
 
-with tab_screen:
-    st.markdown('<div class="section-title">米国株スクリーニング（厳しさランク付き）</div>', unsafe_allow_html=True)
+elif active_tab == tab_screen:
+    st.markdown('<div class="section-title">スクリーニング（厳しさランク付き）</div>', unsafe_allow_html=True)
     st.caption("Finvizなどで事前に絞り込んだ候補ティッカーを貼り付けると、3つの条件（厳しい順に "
               "①オーバーヘッドサプライの解消 → ②VCP収縮 → ③50日線・200日線の上）の達成度合いで "
-              "S/A/B/C/Fの5段階ランクを付けます。あくまで機械的な近似判定なので、"
-              "最終判断はご自身の目で行ってください。")
+              "S/A/B/C/Fの5段階ランクを付けます。日本株・米国株どちらも使えます"
+              "（日本株は証券コードのみでOK。自動で「.T」を補完し、ベンチマークもTOPIXに切り替えます）。"
+              "あくまで機械的な近似判定なので、最終判断はご自身の目で行ってください。")
     with st.expander("ランクの意味"):
         for rank, (color, desc) in RANK_INFO.items():
             st.markdown(f'<span style="color:{color};font-weight:700;font-family:\'JetBrains Mono\',monospace">'
                        f'{rank}</span>　{desc}', unsafe_allow_html=True)
 
-    tickers_raw = st.text_area("ティッカーを貼り付け（改行・カンマ・スペース区切り、いくつでも可）",
-                               height=100, placeholder="例：\nAAPL\nMSFT, NVDA\nAMZN")
+    tickers_raw = st.text_area("ティッカー・証券コードを貼り付け（改行・カンマ・スペース区切り、いくつでも可）",
+                               height=100, placeholder="例：\nAAPL\nMSFT, NVDA\n3964\n7203")
     run_screen = st.button("スクリーニング実行", type="primary", use_container_width=True)
 
     if run_screen:
         raw_list = tickers_raw.replace(",", "\n").replace(" ", "\n").splitlines()
-        tickers = sorted(set(t.strip().upper() for t in raw_list if t.strip()))
+        tickers = sorted(set(normalize_ticker(t) for t in raw_list if t.strip()))
         if not tickers:
-            st.warning("ティッカーを1つ以上入力してください。")
+            st.warning("ティッカー・証券コードを1つ以上入力してください。")
         else:
-            with st.spinner("ベンチマーク（S&P500）を取得中..."):
+            with st.spinner("ベンチマーク（S&P500・TOPIX）を取得中..."):
                 try:
-                    benchmark_df = fetch_prices("^GSPC", days=400)
+                    benchmark_us = fetch_prices("^GSPC", days=400)
                 except Exception:
-                    benchmark_df = pd.DataFrame()
+                    benchmark_us = pd.DataFrame()
+                try:
+                    benchmark_jp = fetch_prices("1306.T", days=400)  # TOPIX連動ETF
+                except Exception:
+                    benchmark_jp = pd.DataFrame()
 
-            ranked = {"S": [], "A": [], "B": [], "C": [], "F": []}
+            ranked = {"S": [], "A": [], "B": [], "C": [], "F": [], "データ不足": []}
             error_list = []
             progress = st.progress(0.0, text="判定中...")
             for i, tk in enumerate(tickers):
@@ -709,13 +745,23 @@ with tab_screen:
                         error_list.append(tk)
                     else:
                         ev = evaluate_chart_quality(d)
-                        if not benchmark_df.empty:
-                            ev["rs"] = evaluate_relative_strength(d, benchmark_df, lookback=60)
+                        ev["company_name"] = fetch_company_name(tk)
+                        if is_jp_ticker(tk) and not benchmark_jp.empty:
+                            ev["rs"] = evaluate_relative_strength(d, benchmark_jp, lookback=60,
+                                                                  benchmark_name="TOPIX")
+                        elif not is_jp_ticker(tk) and not benchmark_us.empty:
+                            ev["rs"] = evaluate_relative_strength(d, benchmark_us, lookback=60,
+                                                                  benchmark_name="S&P500")
                         else:
                             ev["rs"] = {"stock_return_pct": None, "bench_return_pct": None,
                                        "rs_status": "判定不可", "explanation": ""}
-                        rank = rank_chart_quality(ev)
-                        ranked[rank].append((tk, ev, d))
+                        if ev.get("above_50ma") is None:
+                            # 200日分のデータが無い（上場・設定から日が浅いなど）＝判定不可。
+                            # Fランク（トレンド崩れ）と混同しないよう、別枠にする。
+                            ranked["データ不足"].append((tk, ev, d))
+                        else:
+                            rank = rank_chart_quality(ev)
+                            ranked[rank].append((tk, ev, d))
                 except Exception:
                     error_list.append(tk)
                 progress.progress((i + 1) / len(tickers), text=f"判定中... {i+1}/{len(tickers)}")
@@ -725,37 +771,68 @@ with tab_screen:
     if "screen_results" in st.session_state:
         ranked, error_list = st.session_state["screen_results"]
 
+        # ①「どのランクに何件あるか」を一番上に一覧で出し、探し回らなくても分かるようにする
+        summary_bits = []
+        for rank in ["S", "A", "B", "C", "F"]:
+            color, _ = RANK_INFO[rank]
+            n = len(ranked[rank])
+            weight = "700" if n > 0 else "400"
+            op = "1" if n > 0 else "0.4"
+            summary_bits.append(f'<span style="color:{color};font-weight:{weight};opacity:{op};'
+                               f'font-family:\'JetBrains Mono\',monospace;margin-right:14px">'
+                               f'{rank} {n}</span>')
+        n_insufficient = len(ranked["データ不足"]) + len(error_list)
+        summary_bits.append(f'<span style="color:{TEXT_MUTED};margin-right:14px">'
+                           f'データ不足/失敗 {n_insufficient}</span>')
+        st.markdown(f'<div class="stat-card" style="margin-bottom:1rem">{"".join(summary_bits)}</div>',
+                   unsafe_allow_html=True)
+
         for rank in ["S", "A", "B"]:
             color, desc = RANK_INFO[rank]
             items = ranked[rank]
+            if not items:
+                # 該当0件のランクは、大きな見出し＋説明文を出さず、1行だけの表示に留めて
+                # 目立たなくする（内山さんが「探さないといけない」と感じた原因はここだったため）。
+                st.markdown(f'<div style="opacity:0.4;font-size:0.8rem;margin-bottom:0.4rem">'
+                           f'<span style="color:{color};font-weight:700;'
+                           f'font-family:\'JetBrains Mono\',monospace">{rank}</span> 該当銘柄なし</div>',
+                           unsafe_allow_html=True)
+                continue
             st.markdown(f'<div class="section-title">'
                        f'<span style="color:{color};font-weight:700;font-family:\'JetBrains Mono\',monospace">'
                        f'{rank}ランク</span>　{desc}（{len(items)}銘柄）</div>', unsafe_allow_html=True)
-            if items:
-                for tk, ev, d in items:
-                    contractions_str = "→".join(f"{c}%" for c in ev["contractions"]) if ev["contractions"] else "―"
-                    sub = f"収縮：{contractions_str}"
-                    if ev["has_overhead"]:
-                        sub += f"　｜オーバーヘッドまであと{ev['overhead_gap_pct']}%"
-                    st.markdown(stat_card_html(tk, f"{rank}ランク", sub=sub, color=color),
-                               unsafe_allow_html=True)
-                    rs = ev.get("rs", {})
-                    if rs.get("rs_status") and rs["rs_status"] != "判定不可":
-                        rs_color = {"強い": POSITIVE, "普通": TEXT_MUTED, "弱い": NEGATIVE}.get(rs["rs_status"], TEXT)
-                        st.markdown(stat_card_html(
-                            "対S&P500 相対力（60営業日）", f"RS {rs['rs_status']}",
-                            sub=f"銘柄 {rs['stock_return_pct']:+.1f}%　vs　指数 {rs['bench_return_pct']:+.1f}%",
-                            color=rs_color), unsafe_allow_html=True)
-                        if rs.get("explanation"):
-                            st.caption(f"💬 {rs['explanation']}")
-                    render_mini_chart(d)
-                    st.caption(reasons_text(ev).replace("\n", "　|　"))
-                    st.markdown('<hr class="divider">', unsafe_allow_html=True)
-            else:
-                st.caption("該当銘柄はありませんでした。")
+            for tk, ev, d in items:
+                contractions_str = "→".join(f"{c}%" for c in ev["contractions"]) if ev["contractions"] else "―"
+                sub = f"収縮：{contractions_str}"
+                if ev["has_overhead"]:
+                    sub += f"　｜オーバーヘッドまであと{ev['overhead_gap_pct']}%"
+                company_name = ev.get("company_name", "")
+                title = f"{tk}　{company_name}" if company_name else tk
+                st.markdown(stat_card_html(title, f"{rank}ランク", sub=sub, color=color),
+                           unsafe_allow_html=True)
+                rs = ev.get("rs", {})
+                if rs.get("rs_status") and rs["rs_status"] != "判定不可":
+                    rs_color = {"強い": POSITIVE, "普通": TEXT_MUTED, "弱い": NEGATIVE}.get(rs["rs_status"], TEXT)
+                    bench_label = rs.get("benchmark_name", "指数")
+                    st.markdown(stat_card_html(
+                        f"対{bench_label} 相対力（60営業日）", f"RS {rs['rs_status']}",
+                        sub=f"銘柄 {rs['stock_return_pct']:+.1f}%　vs　{bench_label} {rs['bench_return_pct']:+.1f}%",
+                        color=rs_color), unsafe_allow_html=True)
+                    if rs.get("explanation"):
+                        st.caption(f"💬 {rs['explanation']}")
+                render_mini_chart(d)
+                st.caption(reasons_text(ev).replace("\n", "　|　"))
+                if st.button(f"「{tk}」を個別チェックで詳しく見る", key=f"goto_single_{rank}_{tk}",
+                            use_container_width=True):
+                    st.session_state["price_df"] = d
+                    st.session_state["price_ticker"] = tk
+                    st.session_state["active_tab"] = tab_single
+                    st.rerun()
+                st.markdown('<hr class="divider">', unsafe_allow_html=True)
 
-        c_items, f_items = ranked["C"], ranked["F"]
-        with st.expander(f"C・Fランク・データ取得失敗（{len(c_items) + len(f_items) + len(error_list)}銘柄）"):
+        c_items, f_items, insuff_items = ranked["C"], ranked["F"], ranked["データ不足"]
+        with st.expander(f"C・Fランク・データ不足・取得失敗（"
+                        f"{len(c_items) + len(f_items) + len(insuff_items) + len(error_list)}銘柄）"):
             for rank in ["C", "F"]:
                 color, desc = RANK_INFO[rank]
                 for tk, ev, d in ranked[rank]:
@@ -766,6 +843,11 @@ with tab_screen:
                     if st.checkbox(f"{tk} のチャートを見る", key=f"cf_chart_{tk}"):
                         render_mini_chart(d)
                     st.markdown('<hr class="divider">', unsafe_allow_html=True)
+            for tk, ev, d in insuff_items:
+                st.markdown(f'<span style="color:{TEXT_MUTED};font-weight:700">❓</span> **{tk}**',
+                           unsafe_allow_html=True)
+                st.caption(reasons_text(ev))
+                st.markdown('<hr class="divider">', unsafe_allow_html=True)
             for tk in error_list:
                 st.write(f"**{tk}**：データ取得失敗")
 
