@@ -453,13 +453,17 @@ def range_bar_html(label: str, days: int, pct, max_scale: float = 60.0) -> str:
 
 def render_mini_chart(df: pd.DataFrame, days: int = 260):
     """終値・50日線・200日線を重ねた小さな折れ線チャートを表示する。
-    「なぜ合格/不合格なのか」をチャートの形そのもので確認できるようにするために使う。"""
+    「なぜ合格/不合格なのか」をチャートの形そのもので確認できるようにするために使う。
+    st.line_chartは白背景で描画されるため、アプリ全体のダーク配色（薄いグレー）をそのまま
+    「終値」の線色に使うと、白背景にほぼ溶け込んで見えなくなってしまう。そのため、
+    チャート内だけは白背景でも視認できる、はっきりした濃い色を別途使う。"""
     d = df.dropna(subset=["close"]).sort_values("date").reset_index(drop=True).copy()
     d["50日線"] = d["close"].rolling(50).mean()
     d["200日線"] = d["close"].rolling(200).mean()
     chart_df = d.tail(days).set_index("date")[["close", "50日線", "200日線"]]
     chart_df = chart_df.rename(columns={"close": "終値"})
-    st.line_chart(chart_df, height=200, color=[TEXT, ACCENT, NEGATIVE])
+    CHART_LINE_DARK = "#2B2F3A"  # 白背景のチャート内でも視認できる、はっきりした濃色（TEXTとは別）
+    st.line_chart(chart_df, height=200, color=[CHART_LINE_DARK, ACCENT, NEGATIVE])
 
 
 RANK_INFO = {
@@ -657,6 +661,16 @@ if active_tab == tab_single:
         </div>
         """, unsafe_allow_html=True)
 
+        if st.button(f"「{ticker}」をスクリーニングのリストに追加", key="add_to_screening_btn"):
+            existing = st.session_state.get("screening_tickers_input", "") or ""
+            names = [n.strip() for n in existing.replace(",", "\n").splitlines() if n.strip()]
+            if ticker not in names:
+                names.append(ticker)
+            st.session_state["screening_tickers_input"] = "\n".join(names)
+            st.session_state["active_tab"] = tab_screen
+            st.toast(f"「{ticker}」をスクリーニングのリストに追加しました。")
+            st.rerun()
+
         base_window = st.slider("基準期間（ボラティリティ計算日数／レンジ幅の中期日数）",
                                 min_value=5, max_value=90, value=20, step=1,
                                 help="ここを動かすと、Yahoo!に再アクセスせず、取得済みのデータの中で"
@@ -716,7 +730,8 @@ elif active_tab == tab_screen:
                        f'{rank}</span>　{desc}', unsafe_allow_html=True)
 
     tickers_raw = st.text_area("ティッカー・証券コードを貼り付け（改行・カンマ・スペース区切り、いくつでも可）",
-                               height=100, placeholder="例：\nAAPL\nMSFT, NVDA\n3964\n7203")
+                               height=100, placeholder="例：\nAAPL\nMSFT, NVDA\n3964\n7203",
+                               key="screening_tickers_input")
     run_screen = st.button("スクリーニング実行", type="primary", use_container_width=True)
 
     if run_screen:
@@ -831,8 +846,15 @@ elif active_tab == tab_screen:
                 st.markdown('<hr class="divider">', unsafe_allow_html=True)
 
         c_items, f_items, insuff_items = ranked["C"], ranked["F"], ranked["データ不足"]
+        cf_tickers = [tk for tk, ev, d in c_items + f_items]
+        # 「チャートを見る」チェックボックスを押すと画面が再描画され、st.expanderは
+        # 何も指定しないと毎回「閉じた状態」に戻ってしまう（せっかく開いたのにチェックした
+        # 瞬間に閉じて見えなくなる、という不具合の原因）。チェック済みのものが1つでもあれば
+        # 開いたままにする。
+        any_chart_checked = any(st.session_state.get(f"cf_chart_{tk}", False) for tk in cf_tickers)
         with st.expander(f"C・Fランク・データ不足・取得失敗（"
-                        f"{len(c_items) + len(f_items) + len(insuff_items) + len(error_list)}銘柄）"):
+                        f"{len(c_items) + len(f_items) + len(insuff_items) + len(error_list)}銘柄）",
+                        expanded=any_chart_checked):
             for rank in ["C", "F"]:
                 color, desc = RANK_INFO[rank]
                 for tk, ev, d in ranked[rank]:
