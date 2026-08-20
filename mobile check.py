@@ -85,14 +85,20 @@ st.markdown(f"""
       color: {TEXT_MUTED} !important;
       font-size: 0.82rem !important;
   }}
-  /* 送信ボタン */
-  div[data-testid="stFormSubmitButton"] button {{
-      background-color: {ACCENT} !important;
-      color: #0B0E14 !important;
-      border: none !important;
+  /* 送信ボタン・通常ボタン（st.form_submit_buttonとst.button、両方に同じ配色を適用） */
+  div[data-testid="stFormSubmitButton"] button, div[data-testid="stButton"] button {{
+      background-color: {SURFACE} !important;
+      color: {TEXT} !important;
+      border: 1px solid {BORDER} !important;
       border-radius: 8px !important;
       font-weight: 700 !important;
       letter-spacing: 0.05em;
+  }}
+  div[data-testid="stFormSubmitButton"] button[kind="primary"],
+  div[data-testid="stButton"] button[kind="primary"] {{
+      background-color: {ACCENT} !important;
+      color: #0B0E14 !important;
+      border: none !important;
   }}
   /* 見出し用ティッカー行 */
   .quote-row {{
@@ -178,6 +184,16 @@ st.markdown(f"""
       color: {TEXT_MUTED};
       letter-spacing: 0.05em;
       margin: 0.2rem 0 0.7rem 0;
+  }}
+  /* エラー・例外表示（st.error、実行時エラー画面など）が、ダーク背景と重なって
+     読みにくくなっていたため、はっきりした配色に上書きする */
+  div[data-testid="stException"], div[data-testid="stAlert"] {{
+      background-color: #2A1418 !important;
+      border: 1px solid {NEGATIVE} !important;
+      border-radius: 8px !important;
+  }}
+  div[data-testid="stException"] *, div[data-testid="stAlert"] * {{
+      color: #FFD9D9 !important;
   }}
 </style>
 """, unsafe_allow_html=True)
@@ -604,6 +620,12 @@ st.markdown(f"""
 tab_single, tab_screen = "個別チェック", "スクリーニング"
 if "active_tab" not in st.session_state:
     st.session_state["active_tab"] = tab_single
+if "pending_tab" in st.session_state:
+    # ラジオボタン（key="active_tab"）がこの下で描画される前に反映させる。
+    # ウィジェットが一度描画された後に同じキーを直接書き換えるとエラーになるため、
+    # ボタン側では「pending_tab」という別のキーに希望のタブ名を入れておき、
+    # 次の再描画の最初（ウィジェットが描画されるより前）にここで正式に反映する。
+    st.session_state["active_tab"] = st.session_state.pop("pending_tab")
 active_tab = st.radio("表示切り替え", [tab_single, tab_screen], key="active_tab",
                       horizontal=True, label_visibility="collapsed")
 
@@ -667,7 +689,7 @@ if active_tab == tab_single:
             if ticker not in names:
                 names.append(ticker)
             st.session_state["screening_tickers_input"] = "\n".join(names)
-            st.session_state["active_tab"] = tab_screen
+            st.session_state["pending_tab"] = tab_screen
             st.toast(f"「{ticker}」をスクリーニングのリストに追加しました。")
             st.rerun()
 
@@ -698,6 +720,13 @@ if active_tab == tab_single:
         if len(trend) >= 2:
             st.markdown('<div class="section-title">ボラティリティの推移（直近分）</div>', unsafe_allow_html=True)
             st.line_chart(trend.set_index("date")["ボラティリティ(%)"], height=140)
+            with st.expander("日付ごとの数値を見る（過去の特定の日を確認したい場合）"):
+                st.caption("グラフだと正確な数値が読み取りにくいため、表でも確認できるようにしています。"
+                          "「基準期間」を変えると、この表の計算日数も連動して変わります。")
+                display_tbl = trend[["date", "ボラティリティ(%)", "ボラティリティ改善率(%)"]].copy()
+                display_tbl["date"] = display_tbl["date"].dt.strftime("%Y-%m-%d")
+                st.dataframe(display_tbl.sort_values("date", ascending=False),
+                           use_container_width=True, height=250, hide_index=True)
 
         range_result = compute_range_contraction_series(df, base_window=base_window)
         if range_result:
@@ -841,7 +870,7 @@ elif active_tab == tab_screen:
                             use_container_width=True):
                     st.session_state["price_df"] = d
                     st.session_state["price_ticker"] = tk
-                    st.session_state["active_tab"] = tab_single
+                    st.session_state["pending_tab"] = tab_single
                     st.rerun()
                 st.markdown('<hr class="divider">', unsafe_allow_html=True)
 
